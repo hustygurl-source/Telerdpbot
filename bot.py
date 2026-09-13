@@ -33,7 +33,6 @@ running_tasks: Dict[str, asyncio.Task] = {}
 user_states: Dict[int, Dict[str, any]] = {}
 db_pool: asyncpg.Pool = None
 
-# Custom Slide & Abuse Pool
 ROAST_MESSAGES = [
     "𝙃𝙇𝙒 𝙋𝙂𝙇 𝘽𝙃𝘼𝙂 𝙈𝙏 🏃‍♂️💨",
     "𝙏𝙀𝙍𝙄 𝘽𝙃𝙀𝙉 𝙈𝘼𝙍𝘿𝙐 ❓",
@@ -152,7 +151,8 @@ def stop_all_group_tasks(chat_id: int) -> int:
     stopped = 0
     keys = [k for k in list(running_tasks.keys()) if k.startswith(f"{chat_id}_")]
     for k in keys:
-        running_tasks[k].cancel()
+        if isinstance(running_tasks[k], asyncio.Task):
+            running_tasks[k].cancel()
         del running_tasks[k]
         stopped += 1
     return stopped
@@ -168,7 +168,7 @@ async def get_chat_admin_ids(chat_id: int) -> Set[int]:
     except Exception:
         return set()
 
-# ================= Robust 24/7 Background Loops =================
+# ================= 24/7 Background Loops =================
 async def loop_name_change(chat_id: int, title_base: str):
     idx = 1
     while True:
@@ -178,7 +178,7 @@ async def loop_name_change(chat_id: int, title_base: str):
             new_title = f"{title_base} {emoji_block}"[:128]
             await bot.set_chat_title(chat_id, new_title)
             idx += 1
-            await asyncio.sleep(12)  # Fast safe interval
+            await asyncio.sleep(12)
         except asyncio.CancelledError:
             break
         except TelegramRetryAfter as e:
@@ -219,7 +219,7 @@ async def loop_pfp_rotation(chat_id: int, photos: List[bytes]):
             img_data = photos[idx % len(photos)]
             await bot.set_chat_photo(chat_id, BufferedInputFile(img_data, filename=f"pfp_{idx}.jpg"))
             idx += 1
-            await asyncio.sleep(15)  # Fast continuous PFP change
+            await asyncio.sleep(15)
         except asyncio.CancelledError:
             break
         except TelegramRetryAfter as e:
@@ -315,7 +315,7 @@ async def on_bot_added(event: types.ChatMemberUpdated):
                 except Exception:
                     pass
 
-# ================= /start Command Handlers =================
+# ================= Start & DM Handlers =================
 @dp.message(CommandStart())
 async def handle_start(message: Message):
     settings = await get_admin_settings()
@@ -595,11 +595,11 @@ async def cb_back_panel(query: CallbackQuery):
     await query.answer()
     await open_admin_panel(query.message)
 
-# ================= Group Command Execution Engine =================
+# ================= PRIORITY: Group Command Execution Engine =================
 @dp.message(F.text.startswith("!"))
 async def handle_commands(message: Message):
     chat_id = message.chat.id
-    user_mention = f"[{message.from_user.full_name}](tg://user?id={message.from_user.id})"
+    user_mention = f"[{message.from_user.first_name}](tg://user?id={message.from_user.id})"
     raw_text = message.text.strip()
     parts = raw_text.split(" ", 1)
     cmd = parts[0].lower()
@@ -608,7 +608,10 @@ async def handle_commands(message: Message):
     # ================= 🛑 Stop Commands =================
     if cmd == "!dall":
         stopped = stop_all_group_tasks(chat_id)
-        return await message.reply(f"🛑 **All Group Tasks Terminated!**\nCleaned `{stopped}` background loop(s) by {user_mention}.", parse_mode="Markdown")
+        return await message.reply(
+            f"🛑 **All Group Tasks Terminated!**\nTerminated `{stopped}` active background task(s) by {user_mention}.",
+            parse_mode="Markdown"
+        )
 
     if cmd == "!dnc":
         stop_group_task(chat_id, "nc")
@@ -777,7 +780,7 @@ async def handle_commands(message: Message):
         await message.reply(f"👋 **Leaving Group** as requested by {user_mention}...")
         await bot.leave_chat(chat_id)
 
-# ================= Interactive Message Capture Router =================
+# ================= Interactive Message Capture & Slidem Router =================
 @dp.message()
 async def global_message_router(message: Message):
     user_id = message.from_user.id
