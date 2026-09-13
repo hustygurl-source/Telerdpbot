@@ -4,7 +4,7 @@ import ssl
 import random
 import asyncio
 import logging
-from typing import Dict, Set
+from typing import Dict, List, Set
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, types, F
@@ -13,6 +13,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, 
     CallbackQuery, Message, BufferedInputFile
 )
+from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
 import asyncpg
 from aiohttp import web
 
@@ -27,11 +28,12 @@ PORT = int(os.getenv("PORT", 8080))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Memory Task & Interactive State Storage
+# Multi-task & State Management
 running_tasks: Dict[str, asyncio.Task] = {}
 user_states: Dict[int, Dict[str, any]] = {}
 db_pool: asyncpg.Pool = None
 
+# Custom Slide & Abuse Pool
 ROAST_MESSAGES = [
     "𝙃𝙇𝙒 𝙋𝙂𝙇 𝘽𝙃𝘼𝙂 𝙈𝙏 🏃‍♂️💨",
     "𝙏𝙀𝙍𝙄 𝘽𝙃𝙀𝙉 𝙈𝘼𝙍𝘿𝙐 ❓",
@@ -53,7 +55,7 @@ ROAST_MESSAGES = [
     "𝙏𝙀𝙍𝙄 𝙈𝘼𝘼 𝙆𝙊 𝘽𝙀𝙉10 𝙈𝙀 𝘾𝙊𝘿𝙐𝙉𝙂𝘼 👽😱"
 ]
 
-MANDATORY_EMOJIS = "❤" * 50 + "💕😒😌🙂👺🥳🤣" * 10
+EMOJI_POOL = ["❤", "💕", "😒", "😌", "🙂", "👺", "🥳", "🤣", "🔥", "👑", "⚡", "✨", "💎"]
 
 START_TEXT_TEMPLATE = """╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮
                𝓥𝙭𝙘𝙤𝙢 𝙀𝙢𝙥𝙞𝙧𝙚'𝙨
@@ -94,7 +96,7 @@ START_TEXT_TEMPLATE = """╭━━━━━━━━━━━━━━━━━�
 ✘ `!dall` ➜ Stop All Tasks
 """
 
-# ================= Database Initialization =================
+# ================= Database Setup =================
 async def init_db():
     global db_pool
     if not DATABASE_URL:
@@ -137,7 +139,7 @@ async def init_db():
             );
         """)
 
-# ================= Task & State Helpers =================
+# ================= Task & State Utilities =================
 def stop_group_task(chat_id: int, task_name: str) -> bool:
     key = f"{chat_id}_{task_name}"
     if key in running_tasks:
@@ -166,62 +168,71 @@ async def get_chat_admin_ids(chat_id: int) -> Set[int]:
     except Exception:
         return set()
 
-# ================= Background Execution Task Loops =================
+# ================= Robust 24/7 Background Loops =================
 async def loop_name_change(chat_id: int, title_base: str):
     idx = 1
-    decorations = ["⚡", "🔥", "👑", "🚀", "✨", "💎"]
-    try:
-        while True:
-            deco = decorations[idx % len(decorations)]
-            new_title = f"{title_base} {deco} {MANDATORY_EMOJIS}"[:128]
-            try:
-                await bot.set_chat_title(chat_id, new_title)
-            except Exception as e:
-                logging.warning(f"NC Loop Rate-limit/Error: {e}")
+    while True:
+        try:
+            chosen_emoji = random.choice(EMOJI_POOL)
+            emoji_block = chosen_emoji * 50
+            new_title = f"{title_base} {emoji_block}"[:128]
+            await bot.set_chat_title(chat_id, new_title)
             idx += 1
-            await asyncio.sleep(25)
-    except asyncio.CancelledError:
-        pass
+            await asyncio.sleep(12)  # Fast safe interval
+        except asyncio.CancelledError:
+            break
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramAPIError as e:
+            logging.warning(f"NC API Error: {e}")
+            await asyncio.sleep(15)
+        except Exception:
+            await asyncio.sleep(10)
 
 async def loop_auto_nc(chat_id: int):
     idx = 0
-    decorations = ["⚡", "🔥", "👑", "🚀"]
-    try:
-        while True:
+    while True:
+        try:
             async with db_pool.acquire() as conn:
                 presets = await conn.fetch("SELECT content FROM global_presets WHERE preset_type = 'nc'")
             if presets:
                 row = presets[idx % len(presets)]
-                deco = decorations[idx % len(decorations)]
-                t = f"{row['content']} {deco} {MANDATORY_EMOJIS}"[:128]
-                try:
-                    await bot.set_chat_title(chat_id, t)
-                except Exception:
-                    pass
+                chosen_emoji = random.choice(EMOJI_POOL)
+                emoji_block = chosen_emoji * 50
+                t = f"{row['content']} {emoji_block}"[:128]
+                await bot.set_chat_title(chat_id, t)
                 idx += 1
-                await asyncio.sleep(25)
+                await asyncio.sleep(12)
             else:
-                await asyncio.sleep(10)
-    except asyncio.CancelledError:
-        pass
+                await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            break
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception:
+            await asyncio.sleep(10)
 
-async def loop_pfp_stream(chat_id: int, file_id: str):
-    try:
-        file = await bot.get_file(file_id)
-        f_bytes = await bot.download_file(file.file_path)
-        img_data = f_bytes.read()
-        while True:
-            try:
-                await bot.set_chat_photo(chat_id, BufferedInputFile(img_data, filename="pfp.jpg"))
-            except Exception as e:
-                logging.warning(f"PFP Loop error: {e}")
-            await asyncio.sleep(30)
-    except asyncio.CancelledError:
-        pass
+async def loop_pfp_rotation(chat_id: int, photos: List[bytes]):
+    idx = 0
+    while True:
+        try:
+            img_data = photos[idx % len(photos)]
+            await bot.set_chat_photo(chat_id, BufferedInputFile(img_data, filename=f"pfp_{idx}.jpg"))
+            idx += 1
+            await asyncio.sleep(15)  # Fast continuous PFP change
+        except asyncio.CancelledError:
+            break
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramAPIError as e:
+            logging.warning(f"PFP Loop API Error: {e}")
+            await asyncio.sleep(15)
+        except Exception:
+            await asyncio.sleep(10)
 
 async def loop_media_stream(chat_id: int, file_id: str, m_type: str, caption: str = ""):
-    try:
-        while True:
+    while True:
+        try:
             if m_type == "photo":
                 await bot.send_photo(chat_id, file_id, caption=caption)
             elif m_type == "video":
@@ -232,14 +243,18 @@ async def loop_media_stream(chat_id: int, file_id: str, m_type: str, caption: st
                 await bot.send_sticker(chat_id, file_id)
             elif m_type == "voice":
                 await bot.send_voice(chat_id, file_id)
-            await asyncio.sleep(2.5)
-    except asyncio.CancelledError:
-        pass
+            await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            break
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception:
+            await asyncio.sleep(3)
 
 async def loop_auto_media(chat_id: int, media_type: str):
     idx = 0
-    try:
-        while True:
+    while True:
+        try:
             async with db_pool.acquire() as conn:
                 presets = await conn.fetch("SELECT content, extra_text FROM global_presets WHERE preset_type = $1", media_type)
             if presets:
@@ -251,22 +266,30 @@ async def loop_auto_media(chat_id: int, media_type: str):
                 elif media_type == "voice":
                     await bot.send_voice(chat_id, fid)
                 idx += 1
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(2.5)
             else:
                 await asyncio.sleep(10)
-    except asyncio.CancelledError:
-        pass
+        except asyncio.CancelledError:
+            break
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception:
+            await asyncio.sleep(3)
 
 async def loop_target_slide(chat_id: int, target: str):
     idx = 0
-    try:
-        while True:
+    while True:
+        try:
             msg = ROAST_MESSAGES[idx % len(ROAST_MESSAGES)]
             await bot.send_message(chat_id, f"{target} {msg}")
             idx += 1
-            await asyncio.sleep(1.8)
-    except asyncio.CancelledError:
-        pass
+            await asyncio.sleep(1.5)
+        except asyncio.CancelledError:
+            break
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception:
+            await asyncio.sleep(2)
 
 # ================= Group Tracking =================
 @dp.my_chat_member()
@@ -286,10 +309,7 @@ async def on_bot_added(event: types.ChatMemberUpdated):
                 try:
                     await bot.send_message(
                         ADMIN_ID,
-                        f"🔔 **New Integration Alert**\n\n"
-                        f"• Group: `{chat.title}`\n"
-                        f"• ID: `{chat.id}`\n"
-                        f"• User: [{user.full_name}](tg://user?id={user.id}) (`{user.id}`)",
+                        f"🔔 **New Integration Alert**\n\n• Group: `{chat.title}`\n• ID: `{chat.id}`\n• User: [{user.full_name}](tg://user?id={user.id}) (`{user.id}`)",
                         parse_mode="Markdown"
                     )
                 except Exception:
@@ -303,11 +323,10 @@ async def handle_start(message: Message):
     if settings and settings['maintenance'] and message.from_user.id != ADMIN_ID:
         return await message.reply("🛠️ Bot is currently under maintenance. Please try again later.")
 
-    # Shared media sender for group and DM
     m_id = settings['start_media_id'] if settings else None
     m_type = settings['start_media_type'] if settings else None
 
-    # 1. In Group Chat
+    # Group Start
     if message.chat.type in ["group", "supergroup"]:
         if m_id:
             try:
@@ -322,7 +341,7 @@ async def handle_start(message: Message):
                 pass
         return await message.reply(START_TEXT_TEMPLATE, parse_mode="Markdown")
 
-    # 2. In Private DM
+    # Private DM Dashboard
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="👥 Groups", callback_data="user_groups"),
@@ -548,7 +567,7 @@ async def cb_preset_list(query: CallbackQuery):
     await query.answer()
     cat = query.data.replace("plist_", "")
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, content, extra_text FROM global_presets WHERE preset_type = $1", cat)
+        rows = await conn.fetch("SELECT id, content FROM global_presets WHERE preset_type = $1", cat)
     if not rows:
         return await query.message.answer(f"No presets loaded under `{cat}` category.")
     
@@ -623,9 +642,9 @@ async def handle_commands(message: Message):
         stop_group_task(chat_id, "autovoicesm")
         return await message.reply(f"🛑 **Auto Voice Spam Terminated** by {user_mention}.", parse_mode="Markdown")
 
-    if cmd == "!dgrouppfp":
+    if cmd in ["!dgrouppfp", "!dgpfp"]:
         stop_group_task(chat_id, "grouppfp")
-        return await message.reply(f"🛑 **Group PFP Loop Terminated** by {user_mention}.", parse_mode="Markdown")
+        return await message.reply(f"🛑 **Group PFP Rotation Terminated** by {user_mention}.", parse_mode="Markdown")
 
     if cmd == "!delallmedia":
         stop_group_task(chat_id, "mediaspm")
@@ -640,7 +659,7 @@ async def handle_commands(message: Message):
         return await message.reply(f"🛑 **Target Slide Lock Terminated** by {user_mention}.", parse_mode="Markdown")
 
     if cmd == "!dslidem":
-        stop_group_task(chat_id, "slidem")
+        running_tasks[f"{chat_id}_slidem_active"] = False
         return await message.reply(f"🛑 **Group Slide Attack Terminated** by {user_mention}.", parse_mode="Markdown")
 
     # ================= 🚀 Execution Commands =================
@@ -708,7 +727,7 @@ async def handle_commands(message: Message):
             fid = message.reply_to_message.voice.file_id
             stop_group_task(chat_id, "voicesm")
             task = asyncio.create_task(loop_media_stream(chat_id, fid, "voice"))
-            running_tasks[f"{chat_id}_voicesm"] = task
+            running_tasks[f"{chat_id}_voicespm"] = task
             return await message.reply(f"🎙️ **Voice Spam Stream Activated** by {user_mention}!", parse_mode="Markdown")
         user_states[message.from_user.id] = {"action": "wait_voice", "chat_id": chat_id}
         return await message.reply("🎙️ **Please record or forward the Voice Note** to set for loop.")
@@ -724,14 +743,15 @@ async def handle_commands(message: Message):
         return await message.reply(f"🎙️ **Auto Global Voice Stream Started** by {user_mention}.", parse_mode="Markdown")
 
     if cmd in ["!grouppfp", "!gpfp"]:
-        if message.reply_to_message and message.reply_to_message.photo:
-            fid = message.reply_to_message.photo[-1].file_id
-            stop_group_task(chat_id, "grouppfp")
-            task = asyncio.create_task(loop_pfp_stream(chat_id, fid))
-            running_tasks[f"{chat_id}_grouppfp"] = task
-            return await message.reply(f"✅ **Continuous Group PFP Loop Activated** by {user_mention}!", parse_mode="Markdown")
-        user_states[message.from_user.id] = {"action": "wait_pfp", "chat_id": chat_id}
-        return await message.reply("📸 **Please send the Photo** to set for continuous Group Profile loop.")
+        user_states[message.from_user.id] = {
+            "action": "wait_pfp_3", 
+            "chat_id": chat_id, 
+            "photos": []
+        }
+        return await message.reply(
+            "📸 **Group PFP Rotation Setup**\n\nPlease send **Photo (1/3)** for continuous profile rotation.",
+            parse_mode="Markdown"
+        )
 
     if cmd == "!targetslide":
         if not arg:
@@ -804,7 +824,25 @@ async def global_message_router(message: Message):
             st = user_states[user_id]
             action = st.get("action")
 
-            if action == "wait_sticker" and message.sticker:
+            # 3-Photo PFP Step-by-Step Collector
+            if action == "wait_pfp_3" and message.photo:
+                photo_file = await bot.get_file(message.photo[-1].file_id)
+                f_bytes = await bot.download_file(photo_file.file_path)
+                st["photos"].append(f_bytes.read())
+
+                if len(st["photos"]) == 1:
+                    return await message.reply("✅ Photo (1/3) Received! Now please send **Photo (2/3)**.")
+                elif len(st["photos"]) == 2:
+                    return await message.reply("✅ Photo (2/3) Received! Now please send **Photo (3/3)**.")
+                elif len(st["photos"]) == 3:
+                    photos_list = list(st["photos"])
+                    del user_states[user_id]
+                    stop_group_task(chat_id, "grouppfp")
+                    task = asyncio.create_task(loop_pfp_rotation(chat_id, photos_list))
+                    running_tasks[f"{chat_id}_grouppfp"] = task
+                    return await message.reply("🚀 **All 3 Photos Loaded! Continuous 3-PFP Rotation Started Successfully!**", parse_mode="Markdown")
+
+            elif action == "wait_sticker" and message.sticker:
                 del user_states[user_id]
                 fid = message.sticker.file_id
                 stop_group_task(chat_id, "vstickersm")
@@ -837,21 +875,16 @@ async def global_message_router(message: Message):
                 running_tasks[f"{chat_id}_voicespm"] = task
                 return await message.reply("🎙️ **Voice Loop Started Successfully!**")
 
-            elif action == "wait_pfp" and message.photo:
-                del user_states[user_id]
-                fid = message.photo[-1].file_id
-                stop_group_task(chat_id, "grouppfp")
-                task = asyncio.create_task(loop_pfp_stream(chat_id, fid))
-                running_tasks[f"{chat_id}_grouppfp"] = task
-                return await message.reply("✅ **Continuous Group Profile Picture Loop Activated!**")
-
         # 3. Slidem Roasting for Non-Admins
         if running_tasks.get(f"{chat_id}_slidem_active"):
             admins = await get_chat_admin_ids(chat_id)
             if user_id not in admins and not message.from_user.is_bot:
                 roast = random.choice(ROAST_MESSAGES)
                 tag = f"[{message.from_user.first_name}](tg://user?id={user_id})"
-                await message.reply(f"{tag} {roast}", parse_mode="Markdown")
+                try:
+                    await message.reply(f"{tag} {roast}", parse_mode="Markdown")
+                except Exception:
+                    pass
 
 # ================= Keep-Alive Web Server =================
 async def ping_response(request):
