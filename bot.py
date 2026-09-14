@@ -291,7 +291,10 @@ async def loop_auto_media(chat_id: int, media_type: str):
                 if media_type == "media":
                     await bot.send_photo(chat_id, fid, caption=cap)
                 elif media_type == "voice":
-                    await bot.send_voice(chat_id, fid)
+                    try:
+                        await bot.send_voice(chat_id, fid)
+                    except Exception:
+                        await bot.send_audio(chat_id, fid)
                 idx += 1
                 await asyncio.sleep(2.5)
             else:
@@ -828,8 +831,8 @@ async def handle_commands(message: Message):
         return await message.reply(f"🚀 **Auto Global Media Stream Started** by {user_mention}.", parse_mode="Markdown")
 
     if cmd == "!voicesm":
-        if message.reply_to_message and message.reply_to_message.voice:
-            fid = message.reply_to_message.voice.file_id
+        if message.reply_to_message and (message.reply_to_message.voice or message.reply_to_message.audio):
+            fid = message.reply_to_message.voice.file_id if message.reply_to_message.voice else message.reply_to_message.audio.file_id
             stop_group_task(chat_id, "voicesm")
             task = asyncio.create_task(loop_media_stream(chat_id, fid, "voice"))
             running_tasks[f"{chat_id}_voicespm"] = task
@@ -899,13 +902,13 @@ async def handle_commands(message: Message):
         except Exception as e:
             logging.error(f"Failed to leave chat: {e}")
 
-# ================= Interactive Message Capture & Slidem Router =================
+# ================= Global Interactive Message Capture =================
 @dp.message()
 async def global_message_router(message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
 
-    # 1. Admin Actions (DM)
+    # 1. Admin Actions in DM
     if user_id in user_states and "admin_action" in user_states[user_id]:
         action = user_states[user_id]["admin_action"]
         del user_states[user_id]
@@ -945,12 +948,18 @@ async def global_message_router(message: Message):
                 await conn.execute("INSERT INTO global_presets (preset_type, content) VALUES ('voice', $1)", fid)
             return await message.reply("✅ Auto Voice Preset Added successfully!")
 
-        elif action == "add_preset_media" and message.photo:
-            fid = message.photo[-1].file_id
-            cap = message.caption or ""
-            async with db_pool.acquire() as conn:
-                await conn.execute("INSERT INTO global_presets (preset_type, content, extra_text) VALUES ('media', $1, $2)", fid, cap)
-            return await message.reply(f"✅ Auto Media Preset Added with caption: `{cap or 'None'}`!")
+        elif action == "add_preset_media":
+            fid = None
+            if message.photo:
+                fid = message.photo[-1].file_id
+            elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+                fid = message.document.file_id
+            
+            if fid:
+                cap = message.caption or ""
+                async with db_pool.acquire() as conn:
+                    await conn.execute("INSERT INTO global_presets (preset_type, content, extra_text) VALUES ('media', $1, $2)", fid, cap)
+                return await message.reply(f"✅ **Auto Media Preset Saved Successfully!**\nCaption: `{cap or 'None'}`", parse_mode="Markdown")
 
     # 2. Group Interactive Flow
     if message.chat.type in ["group", "supergroup"]:
@@ -958,7 +967,6 @@ async def global_message_router(message: Message):
             st = user_states[user_id]
             action = st.get("action")
 
-            # 3-Photo PFP Step-by-Step Collector
             if action == "wait_pfp_3" and message.photo:
                 photo_file = await bot.get_file(message.photo[-1].file_id)
                 f_bytes = await bot.download_file(photo_file.file_path)
@@ -1001,9 +1009,9 @@ async def global_message_router(message: Message):
                 running_tasks[f"{chat_id}_mediaspm"] = task
                 return await message.reply("🚀 **Photo Loop Started Successfully!**")
 
-            elif action == "wait_voice" and message.voice:
+            elif action == "wait_voice" and (message.voice or message.audio):
                 del user_states[user_id]
-                fid = message.voice.file_id
+                fid = message.voice.file_id if message.voice else message.audio.file_id
                 stop_group_task(chat_id, "voicesm")
                 task = asyncio.create_task(loop_media_stream(chat_id, fid, "voice"))
                 running_tasks[f"{chat_id}_voicespm"] = task
