@@ -28,10 +28,14 @@ PORT = int(os.getenv("PORT", 8080))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Multi-task & State Management
+# Memory Task & Interactive State Storage
 running_tasks: Dict[str, asyncio.Task] = {}
 user_states: Dict[int, Dict[str, any]] = {}
 db_pool: asyncpg.Pool = None
+
+# Channels Config
+FORCE_CHANNELS = ["@jyoex", "@comchater"]
+PVT_CHANNEL_LINK = "https://t.me/+gM43iG6v-vFmYjc1"
 
 ROAST_MESSAGES = [
     "𝙃𝙇𝙒 𝙋𝙂𝙇 𝘽𝙃𝘼𝙂 𝙈𝙏 🏃‍♂️💨",
@@ -57,7 +61,7 @@ ROAST_MESSAGES = [
 EMOJI_POOL = ["❤", "💕", "😒", "😌", "🙂", "👺", "🥳", "🤣", "🔥", "👑", "⚡", "✨", "💎"]
 
 START_TEXT_TEMPLATE = """╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮
-               𝓥𝙭𝙘𝙤𝙢 𝙀𝙢𝙥𝙞𝙧𝙚'𝙨
+               𓆰𓆩⃟👑𝑽𝑿𝑪𝑶𝑴 𝑬𝑴𝑷𝑰𝑹𝑬𓆩⃟🇦🇱𓆪
 
 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆 @jyoex
 ° @comchater
@@ -86,6 +90,7 @@ START_TEXT_TEMPLATE = """╭━━━━━━━━━━━━━━━━━�
 
 ✘ `!targetslide <name>` / `!dtargetslide`
 ✘ `!slidem` / `!dslidem`
+✘ `!script` / `!dscript`
 ━━━━━━━━━━━━━━━━━━━━━
         ⚙️ 𝙎𝙔𝙎𝙏𝙀𝙈 𝘾𝙊𝙉𝙏𝙍𝙊𝙇
 
@@ -125,7 +130,9 @@ async def init_db():
                 maintenance BOOLEAN DEFAULT FALSE,
                 new_user_alert BOOLEAN DEFAULT TRUE,
                 start_media_id TEXT,
-                start_media_type TEXT
+                start_media_type TEXT,
+                force_media_id TEXT,
+                force_media_type TEXT
             );
             INSERT INTO admin_settings (id, maintenance, new_user_alert) 
             VALUES (1, FALSE, TRUE) ON CONFLICT (id) DO NOTHING;
@@ -142,7 +149,8 @@ async def init_db():
 def stop_group_task(chat_id: int, task_name: str) -> bool:
     key = f"{chat_id}_{task_name}"
     if key in running_tasks:
-        running_tasks[key].cancel()
+        if isinstance(running_tasks[key], asyncio.Task):
+            running_tasks[key].cancel()
         del running_tasks[key]
         return True
     return False
@@ -168,7 +176,28 @@ async def get_chat_admin_ids(chat_id: int) -> Set[int]:
     except Exception:
         return set()
 
-# ================= 24/7 Background Loops =================
+# ================= Force Channel Checker =================
+async def check_user_joined(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    for ch in FORCE_CHANNELS:
+        try:
+            member = await bot.get_chat_member(chat_id=ch, user_id=user_id)
+            if member.status in ["left", "kicked"]:
+                return False
+        except Exception:
+            pass
+    return True
+
+def get_force_join_markup():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Join Jyoex", url="https://t.me/jyoex")],
+        [InlineKeyboardButton(text="💬 Join Comchater", url="https://t.me/comchater")],
+        [InlineKeyboardButton(text="🛒 Sell Hub", url=PVT_CHANNEL_LINK)],
+        [InlineKeyboardButton(text="🔄 Verify & Continue", callback_data="check_force_sub")]
+    ])
+
+# ================= Background 24x7 Task Loops =================
 async def loop_name_change(chat_id: int, title_base: str):
     idx = 1
     while True:
@@ -183,8 +212,7 @@ async def loop_name_change(chat_id: int, title_base: str):
             break
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
-        except TelegramAPIError as e:
-            logging.warning(f"NC API Error: {e}")
+        except TelegramAPIError:
             await asyncio.sleep(15)
         except Exception:
             await asyncio.sleep(10)
@@ -224,8 +252,7 @@ async def loop_pfp_rotation(chat_id: int, photos: List[bytes]):
             break
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
-        except TelegramAPIError as e:
-            logging.warning(f"PFP Loop API Error: {e}")
+        except TelegramAPIError:
             await asyncio.sleep(15)
         except Exception:
             await asyncio.sleep(10)
@@ -291,7 +318,19 @@ async def loop_target_slide(chat_id: int, target: str):
         except Exception:
             await asyncio.sleep(2)
 
-# ================= Group Tracking =================
+async def loop_script_spam(chat_id: int, script_text: str):
+    while True:
+        try:
+            await bot.send_message(chat_id, script_text)
+            await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            break
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception:
+            await asyncio.sleep(3)
+
+# ================= Bot Added to Group Event =================
 @dp.my_chat_member()
 async def on_bot_added(event: types.ChatMemberUpdated):
     if event.new_chat_member.status in ["member", "administrator"]:
@@ -315,18 +354,39 @@ async def on_bot_added(event: types.ChatMemberUpdated):
                 except Exception:
                     pass
 
-# ================= Start & DM Handlers =================
+# ================= Start & Force Sub Handlers =================
 @dp.message(CommandStart())
 async def handle_start(message: Message):
+    user_id = message.from_user.id
     settings = await get_admin_settings()
-    
-    if settings and settings['maintenance'] and message.from_user.id != ADMIN_ID:
+
+    if settings and settings['maintenance'] and user_id != ADMIN_ID:
         return await message.reply("🛠️ Bot is currently under maintenance. Please try again later.")
+
+    # Force Channel Gate (Private DM Check)
+    if message.chat.type == "private":
+        is_joined = await check_user_joined(user_id)
+        if not is_joined:
+            f_text = (
+                "⚠️ **Access Restricted!**\n\n"
+                "Please join all our required official channels to access and use **VXCOM Empire** automation bot."
+            )
+            f_mid = settings['force_media_id'] if settings else None
+            f_mtype = settings['force_media_type'] if settings else None
+            if f_mid:
+                try:
+                    if f_mtype == "photo":
+                        return await message.answer_photo(photo=f_mid, caption=f_text, reply_markup=get_force_join_markup(), parse_mode="Markdown")
+                    elif f_mtype == "video":
+                        return await message.answer_video(video=f_mid, caption=f_text, reply_markup=get_force_join_markup(), parse_mode="Markdown")
+                except Exception:
+                    pass
+            return await message.answer(f_text, reply_markup=get_force_join_markup(), parse_mode="Markdown")
 
     m_id = settings['start_media_id'] if settings else None
     m_type = settings['start_media_type'] if settings else None
 
-    # Group Start
+    # In Group Chat
     if message.chat.type in ["group", "supergroup"]:
         if m_id:
             try:
@@ -341,7 +401,7 @@ async def handle_start(message: Message):
                 pass
         return await message.reply(START_TEXT_TEMPLATE, parse_mode="Markdown")
 
-    # Private DM Dashboard
+    # In Private DM
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="👥 Groups", callback_data="user_groups"),
@@ -353,7 +413,7 @@ async def handle_start(message: Message):
     welcome_text = (
         f"👑 **Welcome to VXCOM Empire Automation** 👑\n\n"
         f"Hello [{message.from_user.full_name}](tg://user?id={message.from_user.id})!\n"
-        f"Your multi-tenant raid, moderation, and task execution engine is active.\n\n"
+        f"Your multi-tenant task execution & raid engine is active.\n\n"
         f"⚡ **System Status**: Online & Synchronized"
     )
     
@@ -371,7 +431,17 @@ async def handle_start(message: Message):
 
     await message.answer(welcome_text, reply_markup=kb, parse_mode="Markdown")
 
-# ================= User DM Callbacks =================
+@dp.callback_query(F.data == "check_force_sub")
+async def cb_verify_subscription(query: CallbackQuery):
+    await query.answer()
+    is_joined = await check_user_joined(query.from_user.id)
+    if not is_joined:
+        return await query.message.answer("❌ You haven't joined all required channels yet! Please join and retry.")
+    
+    await query.message.delete()
+    await handle_start(query.message)
+
+# ================= User DM Navigation =================
 @dp.callback_query(F.data == "user_groups")
 async def cb_user_groups(query: CallbackQuery):
     await query.answer()
@@ -442,16 +512,13 @@ async def open_admin_panel(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📊 Statistics", callback_data="adm_stats"),
-            InlineKeyboardButton(text="📬 Mailing", callback_data="adm_mailing")
+            InlineKeyboardButton(text=f"🛠️ Maint ({m_status})", callback_data="adm_toggle_maint")
         ],
         [
-            InlineKeyboardButton(text=f"🛠️ Maintenance ({m_status})", callback_data="adm_toggle_maint"),
-            InlineKeyboardButton(text=f"👤 New User ({a_status})", callback_data="adm_toggle_alert")
+            InlineKeyboardButton(text=f"👤 Alert ({a_status})", callback_data="adm_toggle_alert"),
+            InlineKeyboardButton(text="🖼️ Manage Media", callback_data="adm_media_hub")
         ],
-        [
-            InlineKeyboardButton(text="🖼️ Manage Start Media", callback_data="adm_manage_media"),
-            InlineKeyboardButton(text="🔘 Manage Auto Presets", callback_data="adm_presets_menu")
-        ],
+        [InlineKeyboardButton(text="🔘 Manage Auto Presets", callback_data="adm_presets_menu")],
         [InlineKeyboardButton(text="❌ Close Panel", callback_data="adm_close")]
     ])
     await message.reply("⚙️ **Super Admin Control Center**", reply_markup=kb, parse_mode="Markdown")
@@ -462,7 +529,7 @@ async def cb_admin_stats(query: CallbackQuery):
         g_count = await conn.fetchval("SELECT COUNT(*) FROM groups")
         p_count = await conn.fetchval("SELECT COUNT(*) FROM global_presets")
     await query.answer(
-        f"📊 Global Stats:\n• Groups: {g_count}\n• Loops Active: {len(running_tasks)}\n• Presets: {p_count}", 
+        f"📊 Stats:\n• Groups: {g_count}\n• Loops Active: {len(running_tasks)}\n• Presets: {p_count}", 
         show_alert=True
     )
 
@@ -480,23 +547,33 @@ async def cb_toggle_alert(query: CallbackQuery):
         await conn.execute("UPDATE admin_settings SET new_user_alert = NOT new_user_alert WHERE id = 1")
     await open_admin_panel(query.message)
 
-# ================= Start Media Manager =================
+# ================= Media Hub (Start & Force Media) =================
+@dp.callback_query(F.data == "adm_media_hub")
+async def cb_adm_media_hub(query: CallbackQuery):
+    await query.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🖼️ Start Page Media", callback_data="adm_manage_media")],
+        [InlineKeyboardButton(text="🔒 Force Channel Media", callback_data="adm_manage_forcemedia")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back")]
+    ])
+    await query.message.edit_text("🖼️ **Media Management Hub**\nSelect media type to manage:", reply_markup=kb, parse_mode="Markdown")
+
 @dp.callback_query(F.data == "adm_manage_media")
 async def cb_adm_media(query: CallbackQuery):
     await query.answer()
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Set/Change Start Media", callback_data="adm_set_media_prompt")],
-        [InlineKeyboardButton(text="👁️ See Current Media", callback_data="adm_see_media")],
-        [InlineKeyboardButton(text="🗑️ Delete/Reset Media", callback_data="adm_del_media")],
-        [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back")]
+        [InlineKeyboardButton(text="➕ Set Start Media", callback_data="adm_set_media_prompt")],
+        [InlineKeyboardButton(text="👁️ See Current", callback_data="adm_see_media")],
+        [InlineKeyboardButton(text="🗑️ Reset", callback_data="adm_del_media")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_media_hub")]
     ])
-    await query.message.edit_text("🖼️ **Start Page Media Control**\nChoose an action below:", reply_markup=kb, parse_mode="Markdown")
+    await query.message.edit_text("🖼️ **Start Banner Media**", reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "adm_set_media_prompt")
 async def cb_set_media_prompt(query: CallbackQuery):
     await query.answer()
     user_states[query.from_user.id] = {"admin_action": "set_start_media"}
-    await query.message.answer("📸 **Send or forward the Photo, Video, or Sticker** you want to set as the Start Page media.")
+    await query.message.answer("📸 Send or forward the **Photo, Video, or Sticker** for the Start Page.")
 
 @dp.callback_query(F.data == "adm_see_media")
 async def cb_see_media(query: CallbackQuery):
@@ -504,9 +581,7 @@ async def cb_see_media(query: CallbackQuery):
     settings = await get_admin_settings()
     if not settings or not settings['start_media_id']:
         return await query.message.answer("No Start Media currently set.")
-    
-    m_type = settings['start_media_type']
-    m_id = settings['start_media_id']
+    m_type, m_id = settings['start_media_type'], settings['start_media_id']
     try:
         if m_type == "photo":
             await bot.send_photo(query.from_user.id, m_id, caption="Current Start Banner")
@@ -524,6 +599,29 @@ async def cb_del_media(query: CallbackQuery):
         await conn.execute("UPDATE admin_settings SET start_media_id = NULL, start_media_type = NULL WHERE id = 1")
     await open_admin_panel(query.message)
 
+@dp.callback_query(F.data == "adm_manage_forcemedia")
+async def cb_adm_forcemedia(query: CallbackQuery):
+    await query.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Set Force Media", callback_data="adm_set_forcemedia_prompt")],
+        [InlineKeyboardButton(text="🗑️ Reset", callback_data="adm_del_forcemedia")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_media_hub")]
+    ])
+    await query.message.edit_text("🔒 **Force Channel Banner Media**", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "adm_set_forcemedia_prompt")
+async def cb_set_forcemedia_prompt(query: CallbackQuery):
+    await query.answer()
+    user_states[query.from_user.id] = {"admin_action": "set_force_media"}
+    await query.message.answer("📸 Send or forward the **Photo/Video** for Force Join Banner.")
+
+@dp.callback_query(F.data == "adm_del_forcemedia")
+async def cb_del_forcemedia(query: CallbackQuery):
+    await query.answer("Force Join Media Reset!", show_alert=True)
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE admin_settings SET force_media_id = NULL, force_media_type = NULL WHERE id = 1")
+    await open_admin_panel(query.message)
+
 # ================= Dedicated Auto Presets Manager =================
 @dp.callback_query(F.data == "adm_presets_menu")
 async def cb_presets_menu(query: CallbackQuery):
@@ -531,7 +629,7 @@ async def cb_presets_menu(query: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 NC Titles Presets", callback_data="preset_cat_nc")],
         [InlineKeyboardButton(text="🎙️ Voice Presets", callback_data="preset_cat_voice")],
-        [InlineKeyboardButton(text="🖼️ Media Presets", callback_data="preset_cat_media")],
+        [InlineKeyboardButton(text="🖼️ Media+Text Presets", callback_data="preset_cat_media")],
         [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back")]
     ])
     await query.message.edit_text("🔘 **Auto Presets Manager**\nSelect a preset category to manage:", reply_markup=kb, parse_mode="Markdown")
@@ -540,7 +638,7 @@ async def cb_presets_menu(query: CallbackQuery):
 async def cb_preset_category(query: CallbackQuery):
     await query.answer()
     cat = query.data.replace("preset_cat_", "")
-    cat_names = {"nc": "📝 NC Titles", "voice": "🎙️ Voices", "media": "🖼️ Media"}
+    cat_names = {"nc": "📝 NC Titles", "voice": "🎙️ Voices", "media": "🖼️ Media+Text"}
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"➕ Add {cat.upper()}", callback_data=f"padd_{cat}")],
@@ -558,22 +656,22 @@ async def cb_preset_add_prompt(query: CallbackQuery):
     if cat == "nc":
         await query.message.answer("📝 Send the **Text Name** you want to add to Auto NC Presets.")
     elif cat == "voice":
-        await query.message.answer("🎙️ Send the **Voice Note** you want to add to Auto Voice Presets.")
+        await query.message.answer("🎙️ Send or forward the **Voice Note / Audio** for Auto Voice Presets.")
     elif cat == "media":
-        await query.message.answer("🖼️ Send the **Photo with/without caption** for Auto Media Presets.")
+        await query.message.answer("🖼️ Send the **Photo (with or without caption)** for Auto Media Presets.")
 
 @dp.callback_query(F.data.startswith("plist_"))
 async def cb_preset_list(query: CallbackQuery):
     await query.answer()
     cat = query.data.replace("plist_", "")
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, content FROM global_presets WHERE preset_type = $1", cat)
+        rows = await conn.fetch("SELECT id, content, extra_text FROM global_presets WHERE preset_type = $1", cat)
     if not rows:
         return await query.message.answer(f"No presets loaded under `{cat}` category.")
     
     text = f"📋 **Loaded {cat.upper()} Presets ({len(rows)} items):**\n\n"
     for r in rows:
-        val = r['content'][:25] if cat == "nc" else f"ID: {r['id']} (Media Object)"
+        val = r['content'][:25] if cat == "nc" else f"ID: {r['id']} (Caption: {r['extra_text'] or 'None'})"
         text += f"• `{r['id']}`: {val}\n"
     await query.message.answer(text, parse_mode="Markdown")
 
@@ -609,7 +707,7 @@ async def handle_commands(message: Message):
     if cmd == "!dall":
         stopped = stop_all_group_tasks(chat_id)
         return await message.reply(
-            f"🛑 **All Group Tasks Terminated!**\nTerminated `{stopped}` active background task(s) by {user_mention}.",
+            f"🛑 **All Group Tasks Terminated!**\nCleaned and stopped `{stopped}` active background task(s) by {user_mention}.",
             parse_mode="Markdown"
         )
 
@@ -655,7 +753,7 @@ async def handle_commands(message: Message):
         stop_group_task(chat_id, "gifsm")
         stop_group_task(chat_id, "voicesm")
         stop_group_task(chat_id, "grouppfp")
-        return await message.reply(f"🧹 **All Active Media Streams Purged** by {user_mention}.", parse_mode="Markdown")
+        return await message.reply(f"🧹 **All Active Media Streams Purged & Reset** by {user_mention}.", parse_mode="Markdown")
 
     if cmd == "!dtargetslide":
         stop_group_task(chat_id, "targetslide")
@@ -664,6 +762,10 @@ async def handle_commands(message: Message):
     if cmd == "!dslidem":
         running_tasks[f"{chat_id}_slidem_active"] = False
         return await message.reply(f"🛑 **Group Slide Attack Terminated** by {user_mention}.", parse_mode="Markdown")
+
+    if cmd == "!dscript":
+        stop_group_task(chat_id, "script")
+        return await message.reply(f"🛑 **Custom Script Spam Terminated** by {user_mention}.", parse_mode="Markdown")
 
     # ================= 🚀 Execution Commands =================
     if cmd == "!nc":
@@ -768,6 +870,20 @@ async def handle_commands(message: Message):
         running_tasks[f"{chat_id}_slidem_active"] = True
         return await message.reply(f"👾 **Global Slide Mode Activated!** All non-admin chat members will be auto-roasted.", parse_mode="Markdown")
 
+    if cmd == "!script":
+        if message.reply_to_message and message.reply_to_message.text:
+            s_text = message.reply_to_message.text
+        elif arg:
+            s_text = arg
+        else:
+            user_states[message.from_user.id] = {"action": "wait_script", "chat_id": chat_id}
+            return await message.reply("📜 **Please send or reply to the long text script** you want to loop 24/7.")
+        
+        stop_group_task(chat_id, "script")
+        task = asyncio.create_task(loop_script_spam(chat_id, s_text))
+        running_tasks[f"{chat_id}_script"] = task
+        return await message.reply(f"🚀 **Continuous 24/7 Script Spam Loop Activated** by {user_mention}!", parse_mode="Markdown")
+
     if cmd == "!status":
         active_in_group = [k.replace(f"{chat_id}_", "") for k in running_tasks.keys() if k.startswith(f"{chat_id}_")]
         t_list = "None" if not active_in_group else ", ".join([f"`{t}`" for t in active_in_group])
@@ -778,7 +894,10 @@ async def handle_commands(message: Message):
 
     if cmd == "!leave":
         await message.reply(f"👋 **Leaving Group** as requested by {user_mention}...")
-        await bot.leave_chat(chat_id)
+        try:
+            await bot.leave_chat(chat_id)
+        except Exception as e:
+            logging.error(f"Failed to leave chat: {e}")
 
 # ================= Interactive Message Capture & Slidem Router =================
 @dp.message()
@@ -786,7 +905,7 @@ async def global_message_router(message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
 
-    # 1. Admin Presets & Start Media Creation via DM
+    # 1. Admin Actions (DM)
     if user_id in user_states and "admin_action" in user_states[user_id]:
         action = user_states[user_id]["admin_action"]
         del user_states[user_id]
@@ -804,14 +923,26 @@ async def global_message_router(message: Message):
                     await conn.execute("UPDATE admin_settings SET start_media_id = $1, start_media_type = $2 WHERE id = 1", fid, mtype)
                 return await message.reply(f"✅ Start Media successfully updated as `{mtype}`!")
 
+        elif action == "set_force_media":
+            fid, mtype = None, None
+            if message.photo:
+                fid, mtype = message.photo[-1].file_id, "photo"
+            elif message.video:
+                fid, mtype = message.video.file_id, "video"
+            if fid:
+                async with db_pool.acquire() as conn:
+                    await conn.execute("UPDATE admin_settings SET force_media_id = $1, force_media_type = $2 WHERE id = 1", fid, mtype)
+                return await message.reply(f"✅ Force Join Banner Media updated as `{mtype}`!")
+
         elif action == "add_preset_nc" and message.text:
             async with db_pool.acquire() as conn:
                 await conn.execute("INSERT INTO global_presets (preset_type, content) VALUES ('nc', $1)", message.text)
             return await message.reply(f"✅ Auto NC Preset Added: `{message.text}`")
 
-        elif action == "add_preset_voice" and message.voice:
+        elif action == "add_preset_voice" and (message.voice or message.audio):
+            fid = message.voice.file_id if message.voice else message.audio.file_id
             async with db_pool.acquire() as conn:
-                await conn.execute("INSERT INTO global_presets (preset_type, content) VALUES ('voice', $1)", message.voice.file_id)
+                await conn.execute("INSERT INTO global_presets (preset_type, content) VALUES ('voice', $1)", fid)
             return await message.reply("✅ Auto Voice Preset Added successfully!")
 
         elif action == "add_preset_media" and message.photo:
@@ -819,9 +950,9 @@ async def global_message_router(message: Message):
             cap = message.caption or ""
             async with db_pool.acquire() as conn:
                 await conn.execute("INSERT INTO global_presets (preset_type, content, extra_text) VALUES ('media', $1, $2)", fid, cap)
-            return await message.reply("✅ Auto Media Preset Added successfully!")
+            return await message.reply(f"✅ Auto Media Preset Added with caption: `{cap or 'None'}`!")
 
-    # 2. Interactive Prompts inside Group
+    # 2. Group Interactive Flow
     if message.chat.type in ["group", "supergroup"]:
         if user_id in user_states and user_states[user_id].get("chat_id") == chat_id:
             st = user_states[user_id]
@@ -877,6 +1008,14 @@ async def global_message_router(message: Message):
                 task = asyncio.create_task(loop_media_stream(chat_id, fid, "voice"))
                 running_tasks[f"{chat_id}_voicespm"] = task
                 return await message.reply("🎙️ **Voice Loop Started Successfully!**")
+
+            elif action == "wait_script" and message.text:
+                del user_states[user_id]
+                s_text = message.text
+                stop_group_task(chat_id, "script")
+                task = asyncio.create_task(loop_script_spam(chat_id, s_text))
+                running_tasks[f"{chat_id}_script"] = task
+                return await message.reply("🚀 **Custom Script Spam Started Successfully!**")
 
         # 3. Slidem Roasting for Non-Admins
         if running_tasks.get(f"{chat_id}_slidem_active"):
