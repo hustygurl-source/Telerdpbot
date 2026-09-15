@@ -28,16 +28,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", 8080))
 
-if not BOT_TOKEN:
-    logging.critical("CRITICAL: BOT_TOKEN is not set in Environment Variables!")
-if not DATABASE_URL:
-    logging.critical("CRITICAL: DATABASE_URL is not set in Environment Variables!")
-
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Background Task Registry
 running_tasks: Dict[str, asyncio.Task] = {}
 db_pool: asyncpg.Pool = None
 
@@ -130,7 +124,6 @@ START_TEXT_TEMPLATE = """╭━━━━━━━━━━━━━━━━━�
 async def init_db():
     global db_pool
     if not DATABASE_URL:
-        logging.error("DATABASE_URL is not configured!")
         return
 
     parsed = urlparse(DATABASE_URL)
@@ -143,17 +136,14 @@ async def init_db():
     for attempt in range(5):
         try:
             db_pool = await asyncpg.create_pool(dsn=clean_dsn, ssl=ctx, min_size=1, max_size=10, timeout=15)
-            logging.info("Connected to PostgreSQL successfully.")
             break
-        except Exception as e:
-            logging.warning(f"Database connection attempt {attempt+1} failed: {e}")
-            await asyncio.sleep(3)
+        except Exception:
+            await asyncio.sleep(2)
 
     if not db_pool:
         try:
             db_pool = await asyncpg.create_pool(dsn=clean_dsn, ssl="require")
-        except Exception as e:
-            logging.error(f"Fallback connection also failed: {e}")
+        except Exception:
             return
 
     try:
@@ -184,9 +174,8 @@ async def init_db():
                     extra_text TEXT
                 );
             """)
-            logging.info("Database schemas verified.")
     except Exception as e:
-        logging.error(f"Table verification failed: {e}")
+        logging.error(f"DB schema error: {e}")
 
 # ================= Task & State Utilities =================
 def stop_group_task(chat_id: int, task_name: str) -> bool:
@@ -226,43 +215,47 @@ async def get_chat_admin_ids(chat_id: int) -> Set[int]:
 
 # ================= Force Channel Checker =================
 async def check_user_joined(user_id: int) -> bool:
-    if user_id == ADMIN_ID:
-        return True
     for ch in FORCE_CHANNELS:
         try:
             member = await bot.get_chat_member(chat_id=ch, user_id=user_id)
             if member.status in ["left", "kicked"]:
                 return False
         except Exception:
-            pass
+            return False
     return True
 
 def get_force_join_markup():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Join Jyoex", url="https://t.me/jyoex")],
-        [InlineKeyboardButton(text="💬 Join Comchater", url="https://t.me/comchater")],
-        [InlineKeyboardButton(text="🛒 Sell Hub", url=PVT_CHANNEL_LINK)],
-        [InlineKeyboardButton(text="🔄 Verify & Continue", callback_data="check_force_sub")]
+        [InlineKeyboardButton(text="📢 Jyoex", url="https://t.me/jyoex")],
+        [InlineKeyboardButton(text="📢 Comchater", url="https://t.me/comchater")],
+        [InlineKeyboardButton(text="📢 Sell Hub", url=PVT_CHANNEL_LINK)],
+        [InlineKeyboardButton(text="✅ Verify", callback_data="check_force_sub")]
     ])
 
 async def send_force_channel_block(message: Message):
     settings = await get_admin_settings()
+    user_name = message.from_user.first_name
+    
     f_text = (
-        f"⚠️ **Access Denied!** [{message.from_user.first_name}](tg://user?id={message.from_user.id})\n\n"
-        "You must join all required official channels before using **VXCOM Empire Bot**!"
+        "⚠️ **Access Restricted**\n\n"
+        f"Hello **{user_name}**, you must join all our required official channels below to access this bot:\n\n"
+        "_Click each channel to join, then tap Verify:_"
     )
+    
     f_mid = settings['force_media_id'] if settings else None
     f_mtype = settings['force_media_type'] if settings else None
     
     if f_mid:
         try:
             if f_mtype == "photo":
-                return await message.reply_photo(photo=f_mid, caption=f_text, reply_markup=get_force_join_markup(), parse_mode="Markdown")
+                return await message.answer_photo(photo=f_mid, caption=f_text, reply_markup=get_force_join_markup(), parse_mode="Markdown")
             elif f_mtype == "video":
-                return await message.reply_video(video=f_mid, caption=f_text, reply_markup=get_force_join_markup(), parse_mode="Markdown")
+                return await message.answer_video(video=f_mid, caption=f_text, reply_markup=get_force_join_markup(), parse_mode="Markdown")
+            elif f_mtype == "animation":
+                return await message.answer_animation(animation=f_mid, caption=f_text, reply_markup=get_force_join_markup(), parse_mode="Markdown")
         except Exception:
             pass
-    return await message.reply(f_text, reply_markup=get_force_join_markup(), parse_mode="Markdown")
+    return await message.answer(f_text, reply_markup=get_force_join_markup(), parse_mode="Markdown")
 
 # ================= 24/7 Background Loops =================
 async def loop_name_change(chat_id: int, title_base: str):
@@ -420,16 +413,8 @@ async def on_bot_added(event: types.ChatMemberUpdated):
                         VALUES ($1, $2, $3)
                         ON CONFLICT (chat_id) DO UPDATE SET chat_title = $2, added_by = $3
                     """, chat.id, chat.title, user.id)
-                    
-                    st = await conn.fetchrow("SELECT new_user_alert FROM admin_settings WHERE id = 1")
-                    if st and st['new_user_alert'] and ADMIN_ID:
-                        await bot.send_message(
-                            ADMIN_ID,
-                            f"🔔 **New Integration Alert**\n\n• Group: `{chat.title}`\n• ID: `{chat.id}`\n• User: [{user.full_name}](tg://user?id={user.id}) (`{user.id}`)",
-                            parse_mode="Markdown"
-                        )
-            except Exception as e:
-                logging.error(f"Failed to record group join: {e}")
+            except Exception:
+                pass
 
 # ================= Start Handler =================
 @dp.message(CommandStart())
@@ -460,6 +445,8 @@ async def handle_start(message: Message, state: FSMContext):
                 elif m_type == "sticker":
                     await message.reply_sticker(sticker=m_id)
                     return await message.answer(START_TEXT_TEMPLATE, parse_mode="Markdown")
+                elif m_type == "animation":
+                    return await message.reply_animation(animation=m_id, caption=START_TEXT_TEMPLATE, parse_mode="Markdown")
             except Exception:
                 pass
         return await message.reply(START_TEXT_TEMPLATE, parse_mode="Markdown")
@@ -489,6 +476,8 @@ async def handle_start(message: Message, state: FSMContext):
             elif m_type == "sticker":
                 await message.answer_sticker(sticker=m_id)
                 return await message.answer(welcome_text, reply_markup=kb, parse_mode="Markdown")
+            elif m_type == "animation":
+                return await message.answer_animation(animation=m_id, caption=welcome_text, reply_markup=kb, parse_mode="Markdown")
         except Exception:
             pass
 
@@ -496,11 +485,11 @@ async def handle_start(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "check_force_sub")
 async def cb_verify_subscription(query: CallbackQuery, state: FSMContext):
-    await query.answer()
     is_joined = await check_user_joined(query.from_user.id)
     if not is_joined:
-        return await query.message.answer("❌ You haven't joined all required channels yet! Please join and retry.")
+        return await query.answer("❌ You haven't joined all required channels yet! Please join and retry.", show_alert=True)
     
+    await query.answer("✅ Verification Successful!")
     try:
         await query.message.delete()
     except Exception:
@@ -692,7 +681,7 @@ async def cb_adm_forcemedia(query: CallbackQuery):
 async def cb_set_forcemedia_prompt(query: CallbackQuery, state: FSMContext):
     await query.answer()
     await state.set_state(AdminState.wait_force_media)
-    await query.message.answer("📸 Send or forward the **Photo/Video** for Force Join Banner.")
+    await query.message.answer("📸 Send or forward the **Photo, Video, or GIF** for Force Join Banner.")
 
 @dp.callback_query(F.data == "adm_del_forcemedia")
 async def cb_del_forcemedia(query: CallbackQuery, state: FSMContext):
@@ -808,13 +797,15 @@ async def fsm_admin_force_media(message: Message, state: FSMContext):
         fid, mtype = message.photo[-1].file_id, "photo"
     elif message.video:
         fid, mtype = message.video.file_id, "video"
+    elif message.animation:
+        fid, mtype = message.animation.file_id, "animation"
     
     if fid and db_pool:
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE admin_settings SET force_media_id = $1, force_media_type = $2 WHERE id = 1", fid, mtype)
         await state.clear()
         return await message.reply(f"✅ **Force Join Media successfully saved as** `{mtype}`!", parse_mode="Markdown")
-    await message.reply("❌ Invalid format! Please send Photo or Video.")
+    await message.reply("❌ Invalid format! Please send Photo, Video, or GIF.")
 
 @dp.message(AdminState.wait_preset_nc)
 async def fsm_admin_preset_nc(message: Message, state: FSMContext):
@@ -1177,7 +1168,6 @@ async def ping_response(request):
     return web.Response(text="Bot Engine is Active and Running!")
 
 async def main():
-    # 1. Start Web Server First for Immediate Health Check Passing
     app = web.Application()
     app.router.add_get("/", ping_response)
     app.router.add_get("/ping", ping_response)
@@ -1186,12 +1176,9 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logging.info(f"Health server listening on port {PORT}")
+    logging.info(f"Health server live on port {PORT}")
     
-    # 2. Asynchronously Connect DB
     await init_db()
-    
-    # 3. Start Polling
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
