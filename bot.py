@@ -28,6 +28,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", 8080))
 
+if not BOT_TOKEN:
+    logging.critical("CRITICAL: BOT_TOKEN is not set in Environment Variables!")
+if not DATABASE_URL:
+    logging.critical("CRITICAL: DATABASE_URL is not set in Environment Variables!")
+
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -121,11 +126,13 @@ START_TEXT_TEMPLATE = """╭━━━━━━━━━━━━━━━━━�
 ✘ `!dall` ➜ Stop All Tasks
 """
 
-# ================= Database Setup =================
+# ================= Safe Database Setup =================
 async def init_db():
     global db_pool
     if not DATABASE_URL:
+        logging.error("DATABASE_URL is not configured!")
         return
+
     parsed = urlparse(DATABASE_URL)
     clean_dsn = f"postgresql://{parsed.username}:{parsed.password}@{parsed.hostname}:{parsed.port or 5432}/{parsed.path.lstrip('/')}"
     
@@ -133,38 +140,53 @@ async def init_db():
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    try:
-        db_pool = await asyncpg.create_pool(dsn=clean_dsn, ssl=ctx, min_size=1, max_size=10)
-    except Exception:
-        db_pool = await asyncpg.create_pool(dsn=clean_dsn, ssl="require")
+    for attempt in range(5):
+        try:
+            db_pool = await asyncpg.create_pool(dsn=clean_dsn, ssl=ctx, min_size=1, max_size=10, timeout=15)
+            logging.info("Connected to PostgreSQL successfully.")
+            break
+        except Exception as e:
+            logging.warning(f"Database connection attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(3)
 
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS groups (
-                chat_id BIGINT PRIMARY KEY,
-                chat_title TEXT,
-                added_by BIGINT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS admin_settings (
-                id INT PRIMARY KEY DEFAULT 1,
-                maintenance BOOLEAN DEFAULT FALSE,
-                new_user_alert BOOLEAN DEFAULT TRUE,
-                start_media_id TEXT,
-                start_media_type TEXT,
-                force_media_id TEXT,
-                force_media_type TEXT
-            );
-            INSERT INTO admin_settings (id, maintenance, new_user_alert) 
-            VALUES (1, FALSE, TRUE) ON CONFLICT (id) DO NOTHING;
-            
-            CREATE TABLE IF NOT EXISTS global_presets (
-                id SERIAL PRIMARY KEY,
-                preset_type TEXT,
-                content TEXT,
-                extra_text TEXT
-            );
-        """)
+    if not db_pool:
+        try:
+            db_pool = await asyncpg.create_pool(dsn=clean_dsn, ssl="require")
+        except Exception as e:
+            logging.error(f"Fallback connection also failed: {e}")
+            return
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS groups (
+                    chat_id BIGINT PRIMARY KEY,
+                    chat_title TEXT,
+                    added_by BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS admin_settings (
+                    id INT PRIMARY KEY DEFAULT 1,
+                    maintenance BOOLEAN DEFAULT FALSE,
+                    new_user_alert BOOLEAN DEFAULT TRUE,
+                    start_media_id TEXT,
+                    start_media_type TEXT,
+                    force_media_id TEXT,
+                    force_media_type TEXT
+                );
+                INSERT INTO admin_settings (id, maintenance, new_user_alert) 
+                VALUES (1, FALSE, TRUE) ON CONFLICT (id) DO NOTHING;
+                
+                CREATE TABLE IF NOT EXISTS global_presets (
+                    id SERIAL PRIMARY KEY,
+                    preset_type TEXT,
+                    content TEXT,
+                    extra_text TEXT
+                );
+            """)
+            logging.info("Database schemas verified.")
+    except Exception as e:
+        logging.error(f"Table verification failed: {e}")
 
 # ================= Task & State Utilities =================
 def stop_group_task(chat_id: int, task_name: str) -> bool:
@@ -187,8 +209,13 @@ def stop_all_group_tasks(chat_id: int) -> int:
     return stopped
 
 async def get_admin_settings():
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM admin_settings WHERE id = 1")
+    if not db_pool:
+        return None
+    try:
+        async with db_pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM admin_settings WHERE id = 1")
+    except Exception:
+        return None
 
 async def get_chat_admin_ids(chat_id: int) -> Set[int]:
     try:
@@ -261,18 +288,21 @@ async def loop_auto_nc(chat_id: int):
     idx = 0
     while True:
         try:
-            async with db_pool.acquire() as conn:
-                presets = await conn.fetch("SELECT content FROM global_presets WHERE preset_type = 'nc'")
-            if presets:
-                row = presets[idx % len(presets)]
-                chosen_emoji = random.choice(EMOJI_POOL)
-                emoji_block = chosen_emoji * 50
-                t = f"{row['content']} {emoji_block}"[:128]
-                await bot.set_chat_title(chat_id, t)
-                idx += 1
-                await asyncio.sleep(12)
+            if db_pool:
+                async with db_pool.acquire() as conn:
+                    presets = await conn.fetch("SELECT content FROM global_presets WHERE preset_type = 'nc'")
+                if presets:
+                    row = presets[idx % len(presets)]
+                    chosen_emoji = random.choice(EMOJI_POOL)
+                    emoji_block = chosen_emoji * 50
+                    t = f"{row['content']} {emoji_block}"[:128]
+                    await bot.set_chat_title(chat_id, t)
+                    idx += 1
+                    await asyncio.sleep(12)
+                else:
+                    await asyncio.sleep(15)
             else:
-                await asyncio.sleep(15)
+                await asyncio.sleep(10)
         except asyncio.CancelledError:
             break
         except TelegramRetryAfter as e:
@@ -322,21 +352,24 @@ async def loop_auto_media(chat_id: int, media_type: str):
     idx = 0
     while True:
         try:
-            async with db_pool.acquire() as conn:
-                presets = await conn.fetch("SELECT content, extra_text FROM global_presets WHERE preset_type = $1", media_type)
-            if presets:
-                item = presets[idx % len(presets)]
-                fid = item['content']
-                cap = item['extra_text'] or ""
-                if media_type == "media":
-                    await bot.send_photo(chat_id, fid, caption=cap)
-                elif media_type == "voice":
-                    try:
-                        await bot.send_voice(chat_id, fid)
-                    except Exception:
-                        await bot.send_audio(chat_id, fid)
-                idx += 1
-                await asyncio.sleep(2.5)
+            if db_pool:
+                async with db_pool.acquire() as conn:
+                    presets = await conn.fetch("SELECT content, extra_text FROM global_presets WHERE preset_type = $1", media_type)
+                if presets:
+                    item = presets[idx % len(presets)]
+                    fid = item['content']
+                    cap = item['extra_text'] or ""
+                    if media_type == "media":
+                        await bot.send_photo(chat_id, fid, caption=cap)
+                    elif media_type == "voice":
+                        try:
+                            await bot.send_voice(chat_id, fid)
+                        except Exception:
+                            await bot.send_audio(chat_id, fid)
+                    idx += 1
+                    await asyncio.sleep(2.5)
+                else:
+                    await asyncio.sleep(10)
             else:
                 await asyncio.sleep(10)
         except asyncio.CancelledError:
@@ -379,23 +412,24 @@ async def on_bot_added(event: types.ChatMemberUpdated):
     if event.new_chat_member.status in ["member", "administrator"]:
         chat = event.chat
         user = event.from_user
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO groups (chat_id, chat_title, added_by) 
-                VALUES ($1, $2, $3)
-                ON CONFLICT (chat_id) DO UPDATE SET chat_title = $2, added_by = $3
-            """, chat.id, chat.title, user.id)
-            
-            st = await conn.fetchrow("SELECT new_user_alert FROM admin_settings WHERE id = 1")
-            if st and st['new_user_alert'] and ADMIN_ID:
-                try:
-                    await bot.send_message(
-                        ADMIN_ID,
-                        f"🔔 **New Integration Alert**\n\n• Group: `{chat.title}`\n• ID: `{chat.id}`\n• User: [{user.full_name}](tg://user?id={user.id}) (`{user.id}`)",
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
+        if db_pool:
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO groups (chat_id, chat_title, added_by) 
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (chat_id) DO UPDATE SET chat_title = $2, added_by = $3
+                    """, chat.id, chat.title, user.id)
+                    
+                    st = await conn.fetchrow("SELECT new_user_alert FROM admin_settings WHERE id = 1")
+                    if st and st['new_user_alert'] and ADMIN_ID:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            f"🔔 **New Integration Alert**\n\n• Group: `{chat.title}`\n• ID: `{chat.id}`\n• User: [{user.full_name}](tg://user?id={user.id}) (`{user.id}`)",
+                            parse_mode="Markdown"
+                        )
+            except Exception as e:
+                logging.error(f"Failed to record group join: {e}")
 
 # ================= Start Handler =================
 @dp.message(CommandStart())
@@ -477,6 +511,8 @@ async def cb_verify_subscription(query: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "user_groups")
 async def cb_user_groups(query: CallbackQuery):
     await query.answer()
+    if not db_pool:
+        return await query.message.answer("Database connecting... Please retry.")
     async with db_pool.acquire() as conn:
         groups = await conn.fetch("SELECT chat_id, chat_title FROM groups WHERE added_by = $1", query.from_user.id)
     if not groups:
@@ -489,6 +525,8 @@ async def cb_user_groups(query: CallbackQuery):
 @dp.callback_query(F.data == "user_status")
 async def cb_user_status(query: CallbackQuery):
     await query.answer()
+    if not db_pool:
+        return await query.message.answer("Database connecting... Please retry.")
     async with db_pool.acquire() as conn:
         groups = await conn.fetch("SELECT chat_id, chat_title FROM groups WHERE added_by = $1", query.from_user.id)
     
@@ -540,8 +578,8 @@ async def open_admin_panel(message: Message, state: FSMContext):
     await state.clear()
     settings = await get_admin_settings()
     
-    m_status = "🟢 ON" if settings['maintenance'] else "🔴 OFF"
-    a_status = "🔔 ON" if settings['new_user_alert'] else "🔕 OFF"
+    m_status = "🟢 ON" if (settings and settings['maintenance']) else "🔴 OFF"
+    a_status = "🔔 ON" if (settings and settings['new_user_alert']) else "🔕 OFF"
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -559,6 +597,8 @@ async def open_admin_panel(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "adm_stats")
 async def cb_admin_stats(query: CallbackQuery):
+    if not db_pool:
+        return await query.answer("Database connecting...", show_alert=True)
     async with db_pool.acquire() as conn:
         g_count = await conn.fetchval("SELECT COUNT(*) FROM groups")
         p_count = await conn.fetchval("SELECT COUNT(*) FROM global_presets")
@@ -570,15 +610,17 @@ async def cb_admin_stats(query: CallbackQuery):
 @dp.callback_query(F.data == "adm_toggle_maint")
 async def cb_toggle_maint(query: CallbackQuery, state: FSMContext):
     await query.answer("Toggling...")
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE admin_settings SET maintenance = NOT maintenance WHERE id = 1")
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE admin_settings SET maintenance = NOT maintenance WHERE id = 1")
     await open_admin_panel(query.message, state)
 
 @dp.callback_query(F.data == "adm_toggle_alert")
 async def cb_toggle_alert(query: CallbackQuery, state: FSMContext):
     await query.answer("Toggling...")
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE admin_settings SET new_user_alert = NOT new_user_alert WHERE id = 1")
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE admin_settings SET new_user_alert = NOT new_user_alert WHERE id = 1")
     await open_admin_panel(query.message, state)
 
 # ================= Media Hub =================
@@ -631,8 +673,9 @@ async def cb_see_media(query: CallbackQuery):
 @dp.callback_query(F.data == "adm_del_media")
 async def cb_del_media(query: CallbackQuery, state: FSMContext):
     await query.answer("Start Media Deleted!", show_alert=True)
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE admin_settings SET start_media_id = NULL, start_media_type = NULL WHERE id = 1")
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE admin_settings SET start_media_id = NULL, start_media_type = NULL WHERE id = 1")
     await open_admin_panel(query.message, state)
 
 @dp.callback_query(F.data == "adm_manage_forcemedia")
@@ -654,8 +697,9 @@ async def cb_set_forcemedia_prompt(query: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "adm_del_forcemedia")
 async def cb_del_forcemedia(query: CallbackQuery, state: FSMContext):
     await query.answer("Force Join Media Reset!", show_alert=True)
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE admin_settings SET force_media_id = NULL, force_media_type = NULL WHERE id = 1")
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE admin_settings SET force_media_id = NULL, force_media_type = NULL WHERE id = 1")
     await open_admin_panel(query.message, state)
 
 # ================= Dedicated Auto Presets Manager =================
@@ -702,6 +746,8 @@ async def cb_preset_add_prompt(query: CallbackQuery, state: FSMContext):
 async def cb_preset_list(query: CallbackQuery):
     await query.answer()
     cat = query.data.replace("plist_", "")
+    if not db_pool:
+        return await query.message.answer("Database connecting... Please retry.")
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT id, content, extra_text FROM global_presets WHERE preset_type = $1", cat)
     if not rows:
@@ -716,8 +762,9 @@ async def cb_preset_list(query: CallbackQuery):
 @dp.callback_query(F.data.startswith("preset_"))
 async def cb_preset_reset(query: CallbackQuery):
     cat = query.data.replace("preset_", "")
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM global_presets WHERE preset_type = $1", cat)
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM global_presets WHERE preset_type = $1", cat)
     await query.answer(f"All {cat.upper()} Presets Reset!", show_alert=True)
     await cb_presets_menu(query)
 
@@ -747,7 +794,7 @@ async def fsm_admin_start_media(message: Message, state: FSMContext):
     elif message.animation:
         fid, mtype = message.animation.file_id, "animation"
     
-    if fid:
+    if fid and db_pool:
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE admin_settings SET start_media_id = $1, start_media_type = $2 WHERE id = 1", fid, mtype)
         await state.clear()
@@ -762,7 +809,7 @@ async def fsm_admin_force_media(message: Message, state: FSMContext):
     elif message.video:
         fid, mtype = message.video.file_id, "video"
     
-    if fid:
+    if fid and db_pool:
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE admin_settings SET force_media_id = $1, force_media_type = $2 WHERE id = 1", fid, mtype)
         await state.clear()
@@ -771,7 +818,7 @@ async def fsm_admin_force_media(message: Message, state: FSMContext):
 
 @dp.message(AdminState.wait_preset_nc)
 async def fsm_admin_preset_nc(message: Message, state: FSMContext):
-    if message.text:
+    if message.text and db_pool:
         async with db_pool.acquire() as conn:
             await conn.execute("INSERT INTO global_presets (preset_type, content) VALUES ('nc', $1)", message.text)
         await state.clear()
@@ -781,7 +828,7 @@ async def fsm_admin_preset_nc(message: Message, state: FSMContext):
 @dp.message(AdminState.wait_preset_voice)
 async def fsm_admin_preset_voice(message: Message, state: FSMContext):
     fid = message.voice.file_id if message.voice else (message.audio.file_id if message.audio else None)
-    if fid:
+    if fid and db_pool:
         async with db_pool.acquire() as conn:
             await conn.execute("INSERT INTO global_presets (preset_type, content) VALUES ('voice', $1)", fid)
         await state.clear()
@@ -796,7 +843,7 @@ async def fsm_admin_preset_media(message: Message, state: FSMContext):
     elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
         fid = message.document.file_id
     
-    if fid:
+    if fid and db_pool:
         cap = message.caption or ""
         async with db_pool.acquire() as conn:
             await conn.execute("INSERT INTO global_presets (preset_type, content, extra_text) VALUES ('media', $1, $2)", fid, cap)
@@ -896,8 +943,11 @@ async def handle_commands(message: Message, state: FSMContext):
         return await message.reply(f"✅ **Continuous Name Change Loop Activated**\nBase: `{arg}` by {user_mention}.", parse_mode="Markdown")
 
     if cmd == "!autonc":
-        async with db_pool.acquire() as conn:
-            cnt = await conn.fetchval("SELECT COUNT(*) FROM global_presets WHERE preset_type = 'nc'")
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                cnt = await conn.fetchval("SELECT COUNT(*) FROM global_presets WHERE preset_type = 'nc'")
+        else:
+            cnt = 0
         if not cnt:
             return await message.reply("⚠️ **No Auto NC Presets Found!** Add presets from `/panel` first.")
         stop_group_task(chat_id, "autonc")
@@ -937,8 +987,11 @@ async def handle_commands(message: Message, state: FSMContext):
         return await message.reply("🖼️ **Please send the Photo** to set for continuous loop.")
 
     if cmd == "!automediaspm":
-        async with db_pool.acquire() as conn:
-            cnt = await conn.fetchval("SELECT COUNT(*) FROM global_presets WHERE preset_type = 'media'")
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                cnt = await conn.fetchval("SELECT COUNT(*) FROM global_presets WHERE preset_type = 'media'")
+        else:
+            cnt = 0
         if not cnt:
             return await message.reply("⚠️ **No Auto Media Presets Found!** Add presets in `/panel` first.")
         stop_group_task(chat_id, "automediaspm")
@@ -957,8 +1010,11 @@ async def handle_commands(message: Message, state: FSMContext):
         return await message.reply("🎙️ **Please record or forward the Voice Note** to set for loop.")
 
     if cmd == "!autovoicesm":
-        async with db_pool.acquire() as conn:
-            cnt = await conn.fetchval("SELECT COUNT(*) FROM global_presets WHERE preset_type = 'voice'")
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                cnt = await conn.fetchval("SELECT COUNT(*) FROM global_presets WHERE preset_type = 'voice'")
+        else:
+            cnt = 0
         if not cnt:
             return await message.reply("⚠️ **No Auto Voice Presets Found!** Add presets in `/panel` first.")
         stop_group_task(chat_id, "autovoicesm")
@@ -1022,3 +1078,121 @@ async def fsm_pfp_1(message: Message, state: FSMContext):
     f_bytes = await bot.download_file(photo_file.file_path)
     await state.update_data(photos=[f_bytes.read()])
     await state.set_state(GroupState.wait_pfp_2)
+    await message.reply("✅ **Photo (1/3) Received!** Now please send **Photo (2/3)**.", parse_mode="Markdown")
+
+@dp.message(GroupState.wait_pfp_2, F.photo)
+async def fsm_pfp_2(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photos = data.get("photos", [])
+    photo_file = await bot.get_file(message.photo[-1].file_id)
+    f_bytes = await bot.download_file(photo_file.file_path)
+    photos.append(f_bytes.read())
+    await state.update_data(photos=photos)
+    await state.set_state(GroupState.wait_pfp_3)
+    await message.reply("✅ **Photo (2/3) Received!** Now please send **Photo (3/3)**.", parse_mode="Markdown")
+
+@dp.message(GroupState.wait_pfp_3, F.photo)
+async def fsm_pfp_3(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photos = data.get("photos", [])
+    photo_file = await bot.get_file(message.photo[-1].file_id)
+    f_bytes = await bot.download_file(photo_file.file_path)
+    photos.append(f_bytes.read())
+    
+    chat_id = message.chat.id
+    stop_group_task(chat_id, "grouppfp")
+    task = asyncio.create_task(loop_pfp_rotation(chat_id, photos))
+    running_tasks[f"{chat_id}_grouppfp"] = task
+    await state.clear()
+    await message.reply("🚀 **All 3 Photos Loaded! Continuous 3-PFP Rotation Started Successfully!**", parse_mode="Markdown")
+
+@dp.message(GroupState.wait_sticker, F.sticker)
+async def fsm_group_sticker(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    fid = message.sticker.file_id
+    stop_group_task(chat_id, "vstickersm")
+    task = asyncio.create_task(loop_media_stream(chat_id, fid, "sticker"))
+    running_tasks[f"{chat_id}_vstickersm"] = task
+    await state.clear()
+    await message.reply("🚀 **Sticker Loop Started Successfully!**")
+
+@dp.message(GroupState.wait_gif, F.animation | F.document)
+async def fsm_group_gif(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    fid = (message.animation or message.document).file_id
+    stop_group_task(chat_id, "gifsm")
+    task = asyncio.create_task(loop_media_stream(chat_id, fid, "animation"))
+    running_tasks[f"{chat_id}_gifsm"] = task
+    await state.clear()
+    await message.reply("🚀 **GIF Loop Started Successfully!**")
+
+@dp.message(GroupState.wait_photo, F.photo)
+async def fsm_group_photo(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    fid = message.photo[-1].file_id
+    cap = message.caption or ""
+    stop_group_task(chat_id, "mediaspm")
+    task = asyncio.create_task(loop_media_stream(chat_id, fid, "photo", cap))
+    running_tasks[f"{chat_id}_mediaspm"] = task
+    await state.clear()
+    await message.reply("🚀 **Photo Loop Started Successfully!**")
+
+@dp.message(GroupState.wait_voice, F.voice | F.audio)
+async def fsm_group_voice(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    fid = message.voice.file_id if message.voice else message.audio.file_id
+    stop_group_task(chat_id, "voicesm")
+    task = asyncio.create_task(loop_media_stream(chat_id, fid, "voice"))
+    running_tasks[f"{chat_id}_voicespm"] = task
+    await state.clear()
+    await message.reply("🎙️ **Voice Loop Started Successfully!**")
+
+@dp.message(GroupState.wait_script, F.text)
+async def fsm_group_script(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    s_text = message.text
+    stop_group_task(chat_id, "script")
+    task = asyncio.create_task(loop_script_spam(chat_id, s_text))
+    running_tasks[f"{chat_id}_script"] = task
+    await state.clear()
+    await message.reply("🚀 **Custom Script Spam Started Successfully!**")
+
+# ================= Fallback & Slidem Non-Admin Handler =================
+@dp.message(F.chat.type.in_(["group", "supergroup"]))
+async def slidem_and_non_admin_router(message: Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    if running_tasks.get(f"{chat_id}_slidem_active"):
+        admins = await get_chat_admin_ids(chat_id)
+        if user_id not in admins and not message.from_user.is_bot:
+            roast = random.choice(ROAST_MESSAGES)
+            tag = f"[{message.from_user.first_name}](tg://user?id={user_id})"
+            try:
+                await message.reply(f"{tag} {roast}", parse_mode="Markdown")
+            except Exception:
+                pass
+
+# ================= Keep-Alive Web Server =================
+async def ping_response(request):
+    return web.Response(text="Bot Engine is Active and Running!")
+
+async def main():
+    # 1. Start Web Server First for Immediate Health Check Passing
+    app = web.Application()
+    app.router.add_get("/", ping_response)
+    app.router.add_get("/ping", ping_response)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"Health server listening on port {PORT}")
+    
+    # 2. Asynchronously Connect DB
+    await init_db()
+    
+    # 3. Start Polling
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
